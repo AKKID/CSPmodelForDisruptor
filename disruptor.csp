@@ -1,0 +1,88 @@
+datatype producer=p
+Max_size = 8
+Sequence = {0..8}
+channel claim,commit:producer.Sequence
+channel getCursor:Sequence
+channel getMinINSeq:Sequence
+
+datatype Consumer=c1|c2
+channel start_dispatch,end_dispatch:Consumer.Sequence
+channel getMaxOUTSeq:Sequence
+channel getSeq:Consumer.Sequence
+channel start_writing,writingCall,writingRet: producer.Sequence
+--- 需要建立ProducerBarrier 进程，使得代码和模更加匹配。
+
+RingBuffer(seq, cur) = claim?p!seq -> seq < Max_size&RingBuffer ((seq + 1)%Max_size, cur)
+	[]getCursor!cur -> cur < Max_size&RingBuffer(seq, cur)
+---	[]commit?p?curr -> curr < Max_size&RingBuffer(seq,(curr%Max_size))
+	[]commit?p?curr -> if curr == cur + 1 then RingBuffer(seq, (curr) % Max_size) else RingBuffer(seq, cur)
+
+MinSIU(s) = getSeq?c1?seq ->if seq < s then MinSIU1(seq)
+							else MinSIU1(s)
+MinSIU1(s) = getSeq?c2?seq -> if seq < s then MinSIU2(seq) else MinSIU2(s)
+MinSIU2(s) = getMinINSeq!s -> (SKIP; MinSIU(Max_size))
+pGet(seq) = getMinINSeq?s -> if seq == s then pGet(seq)
+							else pCommit((seq + 1)%Max_size)
+pStart(p) = claim!p?seq -> pGet(seq)
+pCommit(s) = writingCall!p!s -> writingRet?p?seq -> commit!p!s -> pStart(p)
+ProducerBarrier(p) = pStart(p) [| {|getMinINSeq|} |] MinSIU(Max_size)
+
+---------------以下是可用代码 必要时回退-----------
+---Producer1(p) = ProducerBarrier(p)
+---Producer2(p) = ProducerBarrier(p)
+-----------------------------------------------
+Producer1(p) = writingCall?p?s -> writingRet!p!s -> Producer1(p)
+Producer2(p) = writingCall?p?s -> writingRet!p!s -> Producer2(p)
+---Producer1(p) = 
+
+
+MaxSIU (s) = getSeq?c1?seq -> if seq > s then MaxSIU1(seq) else MaxSIU1(s)
+MaxSIU1(s) = getSeq?c2?seq -> if seq > s then MaxSIU2(seq) else MaxSIU2(s)
+MaxSIU2(s) = getMaxOUTSeq!s -> (SKIP; MaxSIU (0))
+Start = getCursor?y -> getMaxOUTSeq?seq -> if seq < y then Read(c1, c2) else Start
+Read(c1, c2) =getCursor?y -> start_dispatch!c1!y -> end_dispatch?c1?seq -> start_dispatch!c2!y
+			  -> end_dispatch?c2?seq -> Start
+ConsumerBarrier(c1, c2) =(MaxSIU (0)[|{| getMaxOUTSeq |}|]Start)
+
+Get1(seq) =getSeq!c1!seq -> EventHandler1(seq)
+EventHandler1(seq) = (start_dispatch?c1?s -> end_dispatch!c1!s 
+	    			  -> EventHandler1((seq + 1)%Max_size))[]Get1((seq)%Max_size)
+Get2(seq) = getSeq!c2!seq -> EventHandler2(seq)
+EventHandler2(seq) = (start_dispatch?c2?s -> end_dispatch!c2!s 
+					  -> EventHandler2((seq + 1)%Max_size))[]Get2((seq)%Max_size)
+
+SYSTEM =((((Producer1(p)|||Producer2(p))
+	    [|{|writingRet, writingCall|}|]
+	    ProducerBarrier(p))
+		[|{| commit, claim |} |] 
+		RingBuffer (0, 0))
+		[|{| getCursor |}|]
+		ConsumerBarrier (c1, c2))
+		[|{| getSeq,start_dispatch, end_dispatch |}|]
+		(EventHandler1(0) ||| EventHandler2(0))
+
+assert SYSTEM :[deadlock free [F]]
+
+---DataRaceFree = claim!p!0 -> commit!p!1 -> claim!p!2 -> commit!p!2 ->
+---	   	   claim!p!2 -> commit!p!3 -> claim!p!3 -> commit!p!4 ->
+---           claim!p!4 -> commit!p!5 -> claim!p!5 -> commit!p!6 ->
+---           claim!p!6 -> commit!p!7 -> commit!p!7 -> commit!p!0 -> DataRaceFree
+
+DataRaceFree =  commit!p!2->commit!p!3-> commit!p!4 ->commit!p!5  ->commit!p!6 ->commit!p!7 ->commit!p!0-> commit!p!1->commit!p!4-> DataRaceFree
+System1 = SYSTEM \ {|getSeq, getMinINSeq, getCursor ,start_dispatch, end_dispatch,getMaxOUTSeq,claim |}
+---System1 = SYSTEM \ {|getSeq,getCursor,getMaxOUTSeq |}
+--- assert SYSTEM [T= SYSTEM [claim<->commit] DataRaceFree
+--- G = DataRaceFree [|{|claim,commit|}|] System1
+---assert DataRaceFree [T= DataRaceFree [|{|claim,commit|}|] SYSTEM
+ assert DataRaceFree [T= System1
+--- assert DataRaceFree [T= Producer1(p) ||| Producer2(p)
+ReadingCorrectness = getCursor?s -> getMaxOUTSeq?y -> if y <= s then ReadingCorrectness else STOP
+System2 = SYSTEM \ {|claim, commit, getSeq,start_dispatch,
+end_dispatch, getMinINSeq |}
+
+assert ReadingCorrectness [T= System2
+
+
+
+
+
